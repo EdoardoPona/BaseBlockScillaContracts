@@ -1,0 +1,53 @@
+
+(* This contract simulates the backers. Each backer holds a certain amount of money. This is where the money pldged comes from. In the real platform, 
+in place of this contract there would be an on-ramp solution exchanging fiat currency for tokens, and sending them to the main contract *)
+scilla_version 0
+
+import BoolUtils 
+
+library Helper
+
+let pledge_money_code = Uint32 0
+let backer_does_not_exist_code = Uint32 1 
+let refund_successfull_code = Uint32 2
+
+contract Helper(owner : ByStr20)
+
+field backers_balances : Map String Uint128 = Emp String Uint128      (* how much each of the backers have been refunded *) 
+field total_money : Uint128 = Uint128 0
+field refunded : Bool = False (* is true if the money is refunded *)
+
+
+procedure update_total_money(pledge_size : Uint128)
+    old_total_money <- total_money; 
+    new_total_money = builtin add old_total_money pledge_size;
+    total_money := new_total_money
+end 
+
+(* gets called by the website to send money to the crowdfunding contract. project_address is the address of the contract that handles the moeny *)
+transition pledge_money(backer_id: String, project_address: ByStr20, pledge_size : Uint128)
+    
+    old_balance_option <- backers_balances[backer_id];
+
+    
+    update_total_money pledge_size; 
+        
+
+    msg = { _tag : "pledge_money"; _recipient : project_address; _amount : pledge_size};
+    msgs =
+        let nil = Nil {Message} in
+        Cons {Message} msg nil;
+    send msgs; 
+    
+    e = {_eventname: "pledge_money"; _code: pledge_money_code}; 
+    event e
+end 
+
+
+(* gets called by the crowdfunding contract to refund the money. It is sent here and then from here it would be changed to fiat currency *)
+transition refund_money()
+    accept;
+    true = True; 
+    refunded := true
+end 
+
