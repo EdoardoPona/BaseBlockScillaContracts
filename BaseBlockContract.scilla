@@ -1,0 +1,385 @@
+scilla_version 0
+
+import BoolUtils ListUtils
+
+library CFwithMilestones
+
+
+let vote_is_negative = 
+    fun(num : Uint32) =>
+    fun(den : Uint32) => 
+    fun(total : Uint32) =>
+    fun(negative_votes : Uint32) =>
+        let n = builtin mul num total in
+        let threshold = builtin div n den in
+        builtin lt threshold negative_votes 
+        
+
+(* block less or equal *)
+let bleq =
+  fun (blk1 : BNum) =>
+  fun (blk2 : BNum) =>
+    let bc1 = builtin blt blk1 blk2 in
+    let bc2 = builtin eq blk1 blk2 in
+    orb bc1 bc2
+    
+    
+let string_equality = 
+    fun(a : String) =>
+    fun(b : String) =>
+        builtin eq a b
+        
+        
+let effective_deadline = fun(milestone : Uint32) => fun(milestones_to_deadlines : Map Uint32 BNum) => fun(total_delay : Uint32) =>
+    let milestone_deadline_option = builtin get milestones_to_deadlines milestone in 
+    match milestone_deadline_option with 
+    | None =>
+        BNum 0
+    | Some milestone_deadline =>
+        builtin badd milestone_deadline total_delay
+    end
+
+
+(* vote is open for the current milestone and voter has not voted yet 
+we are assuming that voter is a backer (check should be made in the transition) *)
+(* TODO test me!!! *)
+let can_vote = 
+    fun(current_deadline_time : BNum) => 
+    fun(vote_time : Uint32) => 
+    fun(current_blocknum : BNum) =>
+    fun(voter_username : String) => 
+    fun(current_milestone_voters : List(String)) => 
+        let vote_end = builtin badd current_deadline_time vote_time in 
+        let vote_open = bleq current_blocknum vote_end in
+        let list_mem_string = @list_mem String in 
+        let has_voted = list_mem_string string_equality voter_username current_milestone_voters in
+        let has_not_voted = negb has_voted in 
+        andb has_not_voted vote_open
+        
+         
+(*checks if the first deadline hasn't been reached yet*)    
+let can_back = 
+    fun(deadlines : Map Uint32 BNum) =>
+    fun(current_blocknum : BNum) =>
+        let zero = Uint32 0 in 
+        let first_deadline = builtin get deadlines zero in
+        match first_deadline with 
+        | None =>
+            False 
+        | Some d =>
+            let current_time = current_blocknum in
+            builtin blt current_time d
+        end 
+        
+        
+let is_owner_or_recipient = 
+    fun(sender : ByStr20) =>
+    fun(owner : ByStr20) =>
+    fun(recipient : ByStr20) =>
+        let is_owner = builtin eq sender owner in 
+        let is_recipient = builtin eq sender recipient in 
+        orb is_owner is_recipient 
+        
+
+let is_voting_over = 
+    fun(current_deadline : BNum) =>
+    fun(voting_time : Uint32) =>
+    fun(current_blocknum : BNum) =>
+        let voting_end_time = builtin badd current_deadline voting_time in 
+        builtin blt voting_end_time current_blocknum
+        
+
+let voter_num = 
+    fun(milestone : Uint32) =>
+    fun(milestone_to_voters : Map Uint32 List(String)) =>
+        let milestone_voters_option = builtin get milestone_to_voters milestone in 
+        match milestone_voters_option with 
+        | None =>
+            (* this should return some error *)
+            Uint32 0
+        | Some milestone_voters =>
+            let list_length_String = @list_length String in 
+            list_length_String milestone_voters
+        end 
+        
+            
+let backer_not_in_time_code = Uint32 0
+let backer_has_backed_code = Uint32 1
+let user_cant_vote_code = Uint32 2
+let user_voted_milestone_failed_delay_code = Uint32 300
+let user_voted_milestone_failed_refund_code = Uint32 301 
+let user_voted_milestone_not_failed_code = Uint32 31 
+        
+        
+let one_hundred = Uint32 100
+
+        
+(*each vote has vote_duration many blocks from when it is open to when it is closed 
+votes are open when the milestone reaches the corresponding deadline 
+schedled_sums are the amounts that should be released at every corresponding deadline *)  
+contract CFwithMilestones
+(owner : ByStr20, 
+vote_duration_time : Uint32, 
+campaign_target : Uint128,
+negative_threshold_percentage : Uint32, (* percentage votes that have to be negative in otder for the vote to be rejected *)
+max_failure_num : Uint32, (* number of times each milestone has to fail for the money to get refunded *)
+deadline_delay : Uint32,  (* milestones get delayed by this much if they fail *)  
+helper_contract : ByStr20 )  (* this is the address of the contract that interfaces the platform and this smartcontract. 
+It is what handles payments and right now simulates the backers accounts *)
+
+
+(*these fields could a well be immutable, they are modified only at the beginning by the sender contract *)
+field milestone_names : Map Uint32 String = Emp Uint32 String 
+field scheduled_sums : Map Uint32 Uint128  = Emp Uint32 Uint128 
+field milestones_to_deadlines : Map Uint32 BNum = Emp Uint32 BNum 
+
+
+(* keeping track of who backed and how much. This is used to weight their votes, 
+backers don't have a zilliqa wallet, we handle everything for them*)
+field backers: Map String Uint128 = Emp String Uint128 
+field current_milestone: Uint32 = Uint32 0 (* keeps track of the milestone being worked towards
+starts at 0, but should change to 1 as soon as the campaign_target is raised. At that point the funds
+for milestone 0 are released and we go straight to milestone 1 *)
+field milestone_to_voters: Map Uint32 List(String) = Emp Uint32 List(String) (* maps the each milestone to the list of people who voted for it *)
+field total_raised: Uint128 = Uint128 0 
+field milestone_failed: Bool = False  (* whether the current milestone has surpassed the threshold for negative votes *)
+field milestones_to_failures: Map Uint32 Uint32 = Emp Uint32 Uint32 (* for every milestone stores the number of times it has failed *)
+field total_delay : Uint32 = Uint32 0   (* total delay time to be accounted for *)
+
+
+
+transition add_deadline(milestone_name : String, scheduled_sum : Uint128, deadline : BNum)
+    is_owner = builtin eq owner _sender;
+    match is_owner with 
+    | False =>
+        (* wrong sender *)
+    | True =>
+         (* TODO perform sanity checks such as the new deadline being after the others and check wether you can still add deadlines 
+         (can't add hem once the voting is taking place) *)
+        milestone_names_ <- milestone_names; 
+        milestone_id = builtin size milestone_names_;
+        milestone_names[milestone_id] := milestone_name; 
+        scheduled_sums[milestone_id] := scheduled_sum; 
+        milestones_to_deadlines[milestone_id] := deadline
+    end 
+end 
+
+
+procedure update_milestone_failed()
+    current_milestone_ <- current_milestone; 
+    milestone_to_voters_ <- milestone_to_voters; 
+                
+    backers_ <- backers; 
+    backers_num = builtin size backers_; 
+                
+    negative_votes = voter_num current_milestone_ milestone_to_voters_; 
+    milestone_failed_ = vote_is_negative negative_threshold_percentage one_hundred backers_num negative_votes;
+    milestone_failed := milestone_failed_ 
+end
+
+
+procedure delay_deadlines()
+    old_total_delay <- total_delay; 
+    new_total_delay = builtin add old_total_delay deadline_delay; 
+    total_delay := new_total_delay
+end 
+
+procedure withdraw_money()
+(* send the money to the helper contract *)
+    current_milestone_ <- current_milestone; 
+    current_deadline_amount_option <- scheduled_sums[current_milestone_]; 
+    match current_deadline_amount_option with 
+    | None =>
+        (* something is wrong with current_milestone*)
+    | Some current_deadline_amount =>
+        msg = { _tag : "withdraw_money"; _recipient : helper_contract; _amount : current_deadline_amount};
+        msgs =
+            let nil = Nil {Message} in
+            Cons {Message} msg nil;
+        send msgs
+    end 
+end 
+
+
+procedure refund_remaining_funds()
+(* send the money to the helper contract *)
+    balance <- _balance;
+    msg = { _tag : "refund"; _recipient : helper_contract; _amount : balance};
+    msgs =
+        let nil = Nil {Message} in
+        Cons {Message} msg nil;
+    send msgs 
+end 
+
+
+transition vote(username : String)
+    (* TODO only owner can call this transition, otherwise people could vote on other's behalf *)
+    current_blocknum <- &BLOCKNUMBER; 
+    is_owner = builtin eq owner _sender;
+    match is_owner with 
+    | False =>
+        (* not owner error *)
+    | True =>
+        current_milestone_ <- current_milestone; 
+        current_milestone_name_option <- milestone_names[current_milestone_]; 
+        match current_milestone_name_option with
+        | None =>
+            (*some error*)
+        | Some current_milestone_name =>
+            current_deadline_time_option <- milestones_to_deadlines[current_milestone_];
+            total_delay_ <- total_delay; 
+            milestones_to_deadlines_ <- milestones_to_deadlines; 
+            current_deadline_time = effective_deadline current_milestone_ milestones_to_deadlines_  total_delay_; 
+            match current_deadline_time_option with 
+            | None =>
+                (*some error*)
+            | Some current_deadline_time =>
+                current_milestone_voters_option <- milestone_to_voters[current_milestone_]; 
+                match current_milestone_voters_option with 
+                | None =>
+                    (*some error*)
+                | Some current_milestone_voters =>
+                    
+                    user_can_vote = can_vote current_deadline_time vote_duration_time current_blocknum username current_milestone_voters; 
+                    
+                    match user_can_vote with 
+                    | False => 
+                        (* user can't vote error *)
+                        e = {_eventname: "user_cant_vote"; code: user_cant_vote_code};
+                        event e
+                    | True => 
+                        nil = Nil {String}; (* declaring this as a list, so that we can append them *)
+                        new_voter = Cons {String} username nil; 
+                        list_append_string = @list_append String; 
+                        new_voters = list_append_string new_voter current_milestone_voters;
+                        
+                        milestone_to_voters[current_milestone_] := new_voters;
+                        update_milestone_failed; 
+                        
+                        milestone_failed_ <- milestone_failed; 
+                        
+                        match milestone_failed_ with 
+                        | False =>  
+                            (* milestone has not reached the critical threshold for failure *)
+                            e = {_eventname: "use_voted_milestone_not_failed"; code: user_voted_milestone_not_failed_code}; 
+                            event e
+                        | True =>
+                            (* milestone has reached critical failure threshold *)
+                            (* how many times has this milestone failed? *)
+                            
+                            num_failures_option <- milestones_to_failures[current_milestone_];
+                            match num_failures_option with 
+                            | None =>
+                                (* current milestone is invalid*)
+                            | Some num_failures =>
+                                refund = builtin lt max_failure_num num_failures; 
+                                
+                                match refund with 
+                                | True =>
+                                    (* refund the money *)
+                                    refund_remaining_funds;
+                                    e = {_eventname: "user_voted_milestone_failed_refund"; code: user_voted_milestone_failed_refund_code};
+                                    event e 
+                                | False =>
+                                    delay_deadlines;
+                                    e = {_eventname: "use_voted_milestone_failed_delay"; code: user_voted_milestone_failed_delay_code};
+                                    event e
+                                end     
+                            end 
+                        end 
+                    end 
+                end
+            end
+        end 
+    end 
+end 
+        
+        
+        
+transition pledge_money(username : String)
+    (* the user has sent some money to this project from the webpage *)
+    (*usename is now a backer, we store the amount he pledged in the backers map so we can calucluate his weight in the votes *)
+    current_blocknum <- &BLOCKNUMBER;
+    milestones_to_deadlines_ <- milestones_to_deadlines; 
+    in_time = can_back milestones_to_deadlines_ current_blocknum; 
+    
+    match in_time with 
+    | False => 
+        e = {_eventname: "backer_not_in_time";
+            backer_username: username;
+            msg_amount: _amount;
+            code: backer_not_in_time_code};
+        event e
+        
+    | True =>
+        accept; 
+        backers[username] := _amount;
+        
+        old_total <- total_raised;
+        new_total = builtin add old_total _amount; 
+        total_raised := new_total;
+        
+        e = {_eventname: "backer_has_backed";
+            backer_username: username;
+            msg_amount: _amount; 
+            code: backer_not_in_time_code};
+        event e
+    end
+end 
+
+
+transition withdraw_deadline(milestone : Uint32)
+    (* anyone cal call this transition, the money get's released only if you are the helper_contract or the owner, 
+    ideally, the owner calls the transition, receives the money and then gives it to the recipient (perhaps in fiat if necessary)
+    however, if for some reason the owner doesn't exist anymore (say our website dies) the recipient can always call the transition and 
+    get the money by his own.*)
+    is_authorized = is_owner_or_recipient _sender owner helper_contract; 
+    
+    match is_authorized with
+    | False =>
+        (* sender not authorized error *)
+    | True =>
+        current_blocknum <- &BLOCKNUMBER; 
+        (* now we have to check that the voting period for this deadline has passed, and that the result was positive *)
+        
+        total_delay_ <- total_delay; 
+        milestones_to_deadlines_ <- milestones_to_deadlines; 
+        deadline = effective_deadline milestone milestones_to_deadlines_ total_delay_; 
+        vote_over = is_voting_over deadline vote_duration_time current_blocknum; 
+        
+        match vote_over with 
+        | False =>
+            (*can't withdraw, vote is not over yet *)
+        | True =>
+            (* now we check if the deadline was approved *)
+            
+            (* to count the negative votes, we get the list of voters for this specific deadline, and count them *)
+            current_milestone_ <- current_milestone; 
+            milestone_to_voters_ <- milestone_to_voters; 
+            
+            backers_ <- backers; 
+            backers_num = builtin size backers_; 
+            
+            negative_votes = voter_num current_milestone_ milestone_to_voters_; 
+            neg_vote = vote_is_negative negative_threshold_percentage one_hundred backers_num negative_votes;
+            
+            withdrawal_allowed = negb neg_vote;
+            
+            match withdrawal_allowed with 
+            | False =>
+                (* cannot withdraw money, negative vote *)
+            | True =>
+                (* update current milestone *)
+                current_milestone_ <- current_milestone; 
+                one = Uint32 1; 
+                updated_milestone = builtin add current_milestone_ one; 
+                current_milestone := updated_milestone; 
+                                (* release event *)
+                withdraw_money
+            end 
+        end 
+    end 
+end 
+    
+    
+
